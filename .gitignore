@@ -1,0 +1,53 @@
+# macOS
+.DS_Store
+
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcscmblueprint
+*.xccheckout
+*.xcarchive/
+*.dSYM/
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Editors
+.idea/
+.vscode/
+
+# Local signing and credentials
+*.local.xcconfig
+.env
+.env.*
+!.env.example
+*.p12
+*.pfx
+*.pem
+*.key
+*.cer
+*.mobileprovision
+*.provisionprofile
+
+# Private meeting data and diagnostics
+/Private/
+/Recordings/
+/Transcripts/
+/Logs/
+*.wav
+*.m4a
+*.mp3
+*.aiff
+*.caf
+*.rttm
+*.log
+
+# Python tooling
+__pycache__/
+*.pyc
+
+# Labelled recordings for the speaker scoring test
+MeetingsTests/Fixtures/Scoring/
