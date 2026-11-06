@@ -4,8 +4,13 @@ import SwiftUI
 @main
 struct MeetingsApp: App {
     @State private var store = AppStore()
+    @State private var updateMonitor: Task<Void, Never>?
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
+        @Bindable var settings = store.settings
+
         Window("Meetings", id: "main") {
             RootView()
                 .environment(store)
@@ -15,6 +20,21 @@ struct MeetingsApp: App {
         }
         .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentSize)
+        .onChange(of: store.windowRequest) {
+            openWindow(id: "main")
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        .onChange(of: settings.offlineMode || !settings.automaticallyCheckForUpdates, initial: true) {
+            updateMonitor?.cancel()
+            updateMonitor = nil
+            guard !settings.offlineMode, settings.automaticallyCheckForUpdates else { return }
+            updateMonitor = Task { await store.updates.monitor() }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                Task { await store.updates.check() }
+            }
+        }
 
         Settings {
             SettingsView()
@@ -24,41 +44,16 @@ struct MeetingsApp: App {
                 .appChrome()
         }
 
-        MenuBarExtra {
+        MenuBarExtra(isInserted: $settings.showMenuBarIcon) {
             MenuBarView()
                 .environment(store)
                 .tint(Theme.blue)
                 .preferredColorScheme(store.settings.appearance.colorScheme)
-                .appChrome()
+                .focusEffectDisabled()
         } label: {
-            MenuBarLabel()
-                .environment(store)
+            Image(systemName: store.recorder.isRecording ? "record.circle.fill" : "waveform")
+                .accessibilityLabel("Meetings")
         }
         .menuBarExtraStyle(.window)
-    }
-}
-
-/// The menu bar icon. It is always on screen, so it also brings the main window forward when the app needs
-/// to ask something, such as whether to download the speaker models for a meeting started from the menu bar.
-private struct MenuBarLabel: View {
-    @Environment(AppStore.self) private var store
-    @Environment(\.openWindow) private var openWindow
-    @Environment(\.scenePhase) private var scenePhase
-
-    var body: some View {
-        Image(systemName: store.recorder.isRecording ? "record.circle.fill" : "waveform")
-            .task(id: store.settings.offlineMode || !store.settings.automaticallyCheckForUpdates) {
-                guard !store.settings.offlineMode, store.settings.automaticallyCheckForUpdates else { return }
-                await store.updates.monitor()
-            }
-            .onChange(of: scenePhase) { _, phase in
-                if phase == .active {
-                    Task { await store.updates.check() }
-                }
-            }
-            .onChange(of: store.windowRequest) {
-                NSApp.activate(ignoringOtherApps: true)
-                openWindow(id: "main")
-            }
     }
 }

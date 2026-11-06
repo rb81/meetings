@@ -66,7 +66,7 @@ final class AppStore {
     var speakerModelPrompt: PendingStart?
     /// An in-person meeting that starts by itself once the speaker models finish downloading.
     private(set) var waitingToStart: PendingStart?
-    /// Bumped to bring the main window forward, so a question asked from the menu bar is seen.
+    /// Bumped to open the main window from any entry point, even when the menu bar icon is hidden.
     private(set) var windowRequest = 0
 
     private var transcriber: LiveTranscriber?
@@ -121,6 +121,10 @@ final class AppStore {
         ) { [weak self] in
             Task { @MainActor in self?.togglePause() }
         }
+    }
+
+    func showMainWindow() {
+        windowRequest += 1
     }
 
     // MARK: - Lookup
@@ -277,7 +281,7 @@ final class AppStore {
             } else {
                 speakerModelPrompt = pending
             }
-            windowRequest += 1
+            showMainWindow()
             return
         }
 

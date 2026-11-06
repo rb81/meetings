@@ -1,25 +1,26 @@
-import AppKit
 import SwiftUI
 
 struct MenuBarView: View {
     @Environment(AppStore.self) private var store
-    @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            HStack(spacing: 10) {
+            HStack(spacing: 12) {
                 Text("Meetings")
                     .font(.system(size: 15, weight: .semibold, design: .rounded))
                 Spacer()
                 Button {
-                    NSApp.activate(ignoringOtherApps: true)
-                    openWindow(id: "main")
+                    dismiss()
+                    store.showMainWindow()
                 } label: {
-                    Image(systemName: "arrow.up.forward.app")
+                    Label("Open Meetings", systemImage: "arrow.up.forward.app")
+                        .fixedSize()
                 }
-                .buttonStyle(IconButtonStyle(size: 28))
-                .help("Open Meetings")
+                .buttonStyle(SecondaryButtonStyle(height: 30))
             }
+
+            Divider()
 
             if store.recorder.isRecording {
                 recordingSection
@@ -34,16 +35,32 @@ struct MenuBarView: View {
                 }
             }
 
-            Text("Start or stop from anywhere with ⌃⌥⌘M. Pause or resume with ⌃⌥⌘P.")
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
+            VStack(spacing: 6) {
+                shortcut("Start / stop", keys: "⌃⌥⌘M")
+                shortcut("Pause / resume", keys: "⌃⌥⌘P")
+            }
+            .font(.system(size: 11))
+            .foregroundStyle(.secondary)
         }
         .padding(18)
         .frame(width: 340)
         .background(Theme.canvas)
         .onChange(of: store.windowRequest) {
-            NSApp.activate(ignoringOtherApps: true)
-            openWindow(id: "main")
+            dismiss()
+        }
+        .onChange(of: store.errorMessage) { _, message in
+            if message != nil {
+                store.showMainWindow()
+            }
+        }
+    }
+
+    private func shortcut(_ title: String, keys: String) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Text(keys)
+                .monospaced()
         }
     }
 
@@ -61,9 +78,21 @@ struct MenuBarView: View {
                         Chip(text: "Paused", tint: Theme.amber)
                     }
                 }
-                TimelineView(.periodic(from: .now, by: 1)) { context in
-                    Text(Format.clock(store.recorder.elapsed(at: context.date)))
-                        .font(.system(size: 26, weight: .semibold, design: .rounded).monospacedDigit())
+                HStack {
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        Text(Format.clock(store.recorder.elapsed(at: context.date)))
+                            .font(.system(size: 32, weight: .semibold, design: .rounded).monospacedDigit())
+                    }
+                    Spacer()
+                    Button {
+                        store.addBookmark()
+                    } label: {
+                        Image(systemName: "flag")
+                    }
+                    .buttonStyle(IconButtonStyle(size: 36))
+                    .help("Flag this moment")
+                    .accessibilityLabel("Flag this moment")
+                    .disabled(store.isFinalizing)
                 }
             }
 
@@ -78,20 +107,13 @@ struct MenuBarView: View {
 
             HStack(spacing: 10) {
                 Button {
-                    store.addBookmark()
-                } label: {
-                    Label("Flag", systemImage: "flag")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(SecondaryButtonStyle(height: 36))
-
-                Button {
                     store.togglePause()
                 } label: {
                     Label(
                         store.recorder.isPaused ? "Resume" : "Pause",
                         systemImage: store.recorder.isPaused ? "play.fill" : "pause.fill"
                     )
+                    .lineLimit(1)
                     .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(SecondaryButtonStyle(height: 36))
@@ -100,7 +122,8 @@ struct MenuBarView: View {
                 Button {
                     Task { await store.stopRecording() }
                 } label: {
-                    Label("Stop", systemImage: "stop.fill")
+                    Label(store.isFinalizing ? "Saving..." : "Stop", systemImage: "stop.fill")
+                        .lineLimit(1)
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(PrimaryButtonStyle(height: 36))

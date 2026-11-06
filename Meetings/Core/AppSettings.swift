@@ -102,6 +102,7 @@ final class AppSettings {
         static let aiByDefault = "aiNotesByDefault"
         static let reminders = "meetingReminders"
         static let appearance = "appearance"
+        static let menuBarIcon = "showMenuBarIcon"
         static let offline = NetworkPolicy.offlineKey
         static let provider = "aiProvider"
         static let ollamaURL = "ollamaURL"
@@ -160,6 +161,10 @@ final class AppSettings {
         didSet { UserDefaults.standard.set(appearance.rawValue, forKey: Key.appearance) }
     }
 
+    var showMenuBarIcon: Bool {
+        didSet { UserDefaults.standard.set(showMenuBarIcon, forKey: Key.menuBarIcon) }
+    }
+
     var automaticallyCheckForUpdates: Bool {
         didSet { UserDefaults.standard.set(automaticallyCheckForUpdates, forKey: Key.automaticUpdates) }
     }
@@ -208,6 +213,7 @@ final class AppSettings {
         aiNotesByDefault = defaults.object(forKey: Key.aiByDefault) as? Bool ?? false
         meetingReminders = defaults.object(forKey: Key.reminders) as? Bool ?? false
         appearance = defaults.string(forKey: Key.appearance).flatMap(AppAppearance.init(rawValue:)) ?? .dark
+        showMenuBarIcon = defaults.object(forKey: Key.menuBarIcon) as? Bool ?? true
         automaticallyCheckForUpdates = defaults.object(forKey: Key.automaticUpdates) as? Bool ?? true
         offlineMode = defaults.bool(forKey: Key.offline)
 

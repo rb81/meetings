@@ -38,6 +38,22 @@ import SwiftUI
         .environment(AppStore.preview(.upcoming))
         .tint(Theme.blue)
         .preferredColorScheme(.dark)
-        .appChrome()
+        .focusEffectDisabled()
+}
+
+#Preview("Menu bar, recording") {
+    MenuBarView()
+        .environment(AppStore.preview(.recording))
+        .tint(Theme.blue)
+        .preferredColorScheme(.dark)
+        .focusEffectDisabled()
+}
+
+#Preview("Menu bar, recording, light") {
+    MenuBarView()
+        .environment(AppStore.preview(.recording))
+        .tint(Theme.blue)
+        .preferredColorScheme(.light)
+        .focusEffectDisabled()
 }
 #endif

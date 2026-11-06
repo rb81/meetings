@@ -30,6 +30,15 @@ struct SettingsView: View {
             }
 
             Section {
+                Toggle("Show Meetings in the menu bar", isOn: $settings.showMenuBarIcon)
+                Text("You can also hold Command and drag the icon out of the menu bar to hide it. Meetings keeps running; turn this on to bring the icon back.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } header: {
+                Text("Menu bar")
+            }
+
+            Section {
                 LabeledContent("Location") {
                     Text(store.settings.dataFolder.path(percentEncoded: false))
                         .foregroundStyle(.secondary)
