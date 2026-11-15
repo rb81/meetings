@@ -64,6 +64,8 @@ struct SettingsView: View {
                 Text("Data folder")
             }
 
+            StorageSection()
+
             Section {
                 Picker("Delete audio", selection: $settings.audioRetention) {
                     ForEach(AudioRetention.allCases) { option in
@@ -75,7 +77,7 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
 
                 Toggle("Cancel echo from speakers", isOn: $settings.echoCancellation)
-                Text("Removes other people's voices from your microphone when you're not wearing headphones. It can lower the volume of other apps a little. Applies to online meetings only.")
+                Text("Removes other people's voices from your microphone when you're not wearing headphones. It can lower the volume of other apps a little. Applies to online meetings only. Either way, lines your microphone picks up from the call are left out of the transcript.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -434,6 +436,71 @@ private struct ModelPicker: View {
                 failed = true
             }
             loading = false
+        }
+    }
+}
+
+/// How much disk the speech models and their cache use, with a way to empty the cache.
+private struct StorageSection: View {
+    @Environment(AppStore.self) private var store
+    @State private var modelsSize: Int64?
+    @State private var cacheSize: Int64?
+    @State private var clearing = false
+    @State private var freed: Int64?
+
+    var body: some View {
+        Section {
+            LabeledContent("Speech models") {
+                Text(modelsSize.map(Self.format) ?? "Measuring…")
+                    .foregroundStyle(.secondary)
+            }
+            LabeledContent("Model cache") {
+                HStack(spacing: 8) {
+                    if clearing { ProgressView().controlSize(.small) }
+                    Text(cacheSize.map(Self.format) ?? "Measuring…")
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            HStack {
+                Button("Clear Cache") { clear() }
+                    .disabled(clearing || cacheSize == 0 || store.recorder.isRecording || !store.busyMeetings.isEmpty)
+                if let freed {
+                    Text("Freed \(Self.format(freed)).")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Text("The speech models are downloaded once and kept in your data folder. macOS also keeps a copy optimized for this Mac, so they load quickly. Leftovers from interrupted launches are cleaned up automatically. Clearing the cache frees the rest; the next transcription then takes a little longer to start while it's rebuilt.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        } header: {
+            Text("Storage")
+        }
+        .task(id: store.settings.dataFolder) { await measure() }
+    }
+
+    nonisolated private static func format(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+
+    private func measure() async {
+        let models = store.settings.dataFolder.appendingPathComponent("models", isDirectory: true)
+        let sizes = await Task.detached(priority: .utility) {
+            (CacheJanitor.allocatedSize(of: models), CacheJanitor.size())
+        }.value
+        modelsSize = sizes.0
+        cacheSize = sizes.1
+    }
+
+    private func clear() {
+        clearing = true
+        Task {
+            let amount = await Task.detached(priority: .utility) { CacheJanitor.clear() }.value
+            freed = amount
+            clearing = false
+            await measure()
         }
     }
 }

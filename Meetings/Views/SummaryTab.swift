@@ -8,7 +8,7 @@ struct SummaryTab: View {
 
     @State private var reminderMessage: String?
 
-    private var busy: Bool { store.processing[meeting.id] != nil || meeting.id == store.activeMeetingID }
+    private var busy: Bool { store.isBusy(meeting.id) || meeting.id == store.activeMeetingID }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {

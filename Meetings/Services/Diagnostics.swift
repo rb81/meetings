@@ -22,6 +22,12 @@ struct MeetingDiagnostics: Codable, Hashable {
     var voices: Int?
     /// Why speaker separation didn't fully work, in plain words, or nil when it did.
     var speakerProblem: String?
+    /// How echo cancellation was set up for an online meeting, in plain words.
+    var echoCancellation: String?
+    /// Microphone lines that were the call playing through the speakers, and were left out.
+    var echoLinesRemoved: Int?
+    /// Seconds the microphone was muted during the meeting.
+    var mutedSeconds: Double?
 
     /// A plain-words reason nothing was transcribed, or nil when the audio looks healthy.
     var concern: String? {
@@ -53,6 +59,13 @@ struct MeetingDiagnostics: Codable, Hashable {
         if let system { lines.append(Self.describe("System audio", system)) }
         if !speakerEngine.isEmpty { lines.append("Speaker separation: \(speakerEngine)") }
         if let voices { lines.append("Voices found: \(voices)") }
+        if let echoCancellation { lines.append("Echo cancellation: \(echoCancellation)") }
+        if let echoLinesRemoved, echoLinesRemoved > 0 {
+            lines.append("Microphone lines left out because they were the call playing through the speakers: \(echoLinesRemoved)")
+        }
+        if let mutedSeconds, mutedSeconds >= 1 {
+            lines.append("Microphone muted for \(Format.clock(mutedSeconds))")
+        }
         lines += notes
         if let concern { lines.append("Problem: \(concern)") }
         if let quietWarning { lines.append("Note: \(quietWarning)") }

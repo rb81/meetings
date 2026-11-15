@@ -110,6 +110,8 @@ enum SpeakerLabeler {
         var splits = 0
         /// Voices the speaker model heard separately that turned out to be one person (or noise).
         var merged = 0
+        /// The same, for the call's audio.
+        var systemMerged = 0
     }
 
     /// Who is speaking on the microphone, as the speaker model saw it.
@@ -138,7 +140,7 @@ enum SpeakerLabeler {
     ///   - diarizeMic: Run the careful pass over the microphone. When false, only `liveActivity` is used.
     ///   - room: Nemotron 3 and the voice print model. Without them the older `micManager` is used, if given.
     ///   - liveActivity: The voices heard during the meeting. Used when the careful pass is skipped or fails.
-    ///   - expected: How many people you said were in the room.
+    ///   - expected: How many people you said were in the room, or on the call for an online meeting.
     ///   - pinned: Lines you moved by hand. They keep their speaker, renumbered along with everyone else.
     static func label(
         segments: [TranscriptSegment],
@@ -158,13 +160,20 @@ enum SpeakerLabeler {
         var notes: [String] = []
         var merged = 0
 
-        let systemTurns = await diarizedTurns(
+        let systemPass = await diarizedTurns(
             for: .system,
             audio: systemAudio,
             manager: systemManager,
             normalize: false,
             notes: &notes,
             onProgress: onProgress
+        )
+        // The call's mix of codecs and network dropouts can make one person sound like two. Join voices that
+        // sound alike, and fold extras into their closest match when you said how many people were on the call.
+        let (systemTurns, systemMerged) = joiningSimilarVoices(
+            systemPass.turns,
+            prints: systemPass.prints,
+            expected: inPerson ? nil : expected
         )
 
         var mic = RoomVoices.turns([])
@@ -184,7 +193,7 @@ enum SpeakerLabeler {
                         normalize: true,
                         notes: &notes,
                         onProgress: onProgress
-                    ))
+                    ).turns)
                 } else {
                     notes.append("The in-person speaker models aren't downloaded, so the room wasn't separated after the meeting.")
                 }
@@ -279,8 +288,40 @@ enum SpeakerLabeler {
             micVoices: count(.mic),
             systemVoices: count(.system),
             splits: splits,
-            merged: merged
+            merged: merged,
+            systemMerged: systemMerged
         )
+    }
+
+    /// Folds voices that sound like one person into one, using the speaker model's print of each voice.
+    /// Returns the turns with the folded voices renamed, and how many voices were folded.
+    static func joiningSimilarVoices(
+        _ turns: [SpeakerAssignment.Turn],
+        prints: [String: [Float]],
+        expected: Int?
+    ) -> (turns: [SpeakerAssignment.Turn], merged: Int) {
+        let ids = Array(Set(turns.map(\.speaker))).sorted()
+        guard ids.count > 1 else { return (turns, 0) }
+
+        var seconds: [String: Double] = [:]
+        for turn in turns { seconds[turn.speaker, default: 0] += turn.end - turn.start }
+        let voices = ids.enumerated().map { slot, id in
+            VoiceMerger.Voice(
+                slot: slot,
+                seconds: seconds[id] ?? 0,
+                print: prints[id].flatMap { $0.isEmpty ? nil : VoiceMerger.normalized($0) }
+            )
+        }
+
+        let plan = VoiceMerger.plan(voices: voices, expected: expected)
+        guard !plan.isEmpty else { return (turns, 0) }
+
+        let merged = turns.compactMap { turn -> SpeakerAssignment.Turn? in
+            guard let slot = ids.firstIndex(of: turn.speaker), let target = plan[slot] else { return turn }
+            guard let target else { return nil }
+            return SpeakerAssignment.Turn(speaker: ids[target], start: turn.start, end: turn.end)
+        }
+        return (merged, plan.count)
     }
 
     /// The voice of a whole line: each word votes for who said it, weighted by how long it took to say.
@@ -388,13 +429,13 @@ enum SpeakerLabeler {
         normalize: Bool,
         notes: inout [String],
         onProgress: @escaping @Sendable (String) -> Void
-    ) async -> [SpeakerAssignment.Turn] {
-        guard let audio else { return [] }
+    ) async -> (turns: [SpeakerAssignment.Turn], prints: [String: [Float]]) {
+        guard let audio else { return ([], [:]) }
 
         let name = track == .mic ? "microphone" : "system audio"
         guard let manager else {
             notes.append("The speaker model isn't set up, so the \(name) wasn't separated into speakers.")
-            return []
+            return ([], [:])
         }
 
         let progress: @Sendable (Int, Int) -> Void = { done, total in
@@ -410,19 +451,21 @@ enum SpeakerLabeler {
                     AudioNormalizer.normalized(try AudioFileSamples.read(audio))
                 }.value
                 let result = try await manager.process(audio: samples, progressCallback: progress)
-                return result.segments.map {
-                    SpeakerAssignment.Turn(speaker: $0.speakerId, start: Double($0.startTimeSeconds), end: Double($0.endTimeSeconds))
-                }
+                return (turns(in: result), result.speakerDatabase ?? [:])
             }
 
             let result = try await manager.process(audio, progressCallback: progress)
-            return result.segments.map {
-                SpeakerAssignment.Turn(speaker: $0.speakerId, start: Double($0.startTimeSeconds), end: Double($0.endTimeSeconds))
-            }
+            return (turns(in: result), result.speakerDatabase ?? [:])
         } catch {
             log.error("Speaker separation failed on the \(name): \(error.localizedDescription)")
             notes.append("Speaker separation failed on the \(name): \(error.localizedDescription)")
-            return []
+            return ([], [:])
+        }
+    }
+
+    private static func turns(in result: DiarizationResult) -> [SpeakerAssignment.Turn] {
+        result.segments.map {
+            SpeakerAssignment.Turn(speaker: $0.speakerId, start: Double($0.startTimeSeconds), end: Double($0.endTimeSeconds))
         }
     }
 }

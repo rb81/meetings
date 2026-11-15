@@ -110,25 +110,48 @@ extension TranscriptFile {
     }
 }
 
-/// Drops microphone lines that are really the other participants' voices coming out of the speakers.
+/// Spots microphone lines that are really the other participants' voices coming out of the speakers, by their words.
+/// `EchoDetector` does the same from the sound itself; this catches what it can't judge, such as lines without audio.
 enum EchoFilter {
-    private static let minimumWords = 6
+    /// Lines this short only count when every word was said on the call, inside one line of the call.
+    private static let shortLine = 6
+    private static let minimumWords = 3
     private static let overlapThreshold = 0.8
 
-    static func isEcho(_ mic: TranscriptSegment, of system: TranscriptSegment) -> Bool {
-        guard mic.track == .mic, system.track == .system else { return false }
-        guard mic.start <= system.end + 4, mic.end >= system.start - 1 else { return false }
+    /// Whether `mic` repeats what was said on the call around the same time. Long lines are compared against
+    /// everything said nearby, so a line that spans two of the call's lines is still caught.
+    static func isEcho(_ mic: TranscriptSegment, among segments: [TranscriptSegment]) -> Bool {
+        guard mic.track == .mic, mic.pinned != true else { return false }
+        let nearby = segments.filter { $0.track == .system && mic.start <= $0.end + 4 && mic.end >= $0.start - 1 }
+        guard !nearby.isEmpty else { return false }
 
         let micWords = words(in: mic.text)
-        let systemWords = words(in: system.text)
         guard micWords.count >= minimumWords else { return false }
 
-        let shared = micWords.intersection(systemWords).count
+        if micWords.count < shortLine {
+            return nearby.contains { micWords.isSubset(of: words(in: $0.text)) }
+        }
+        let heard = nearby.reduce(into: Set<String>()) { $0.formUnion(words(in: $1.text)) }
+        let shared = micWords.intersection(heard).count
         return Double(shared) / Double(micWords.count) >= overlapThreshold
+    }
+
+    /// Every line minus the microphone lines that repeat the call.
+    static func removingEchoes(from segments: [TranscriptSegment]) -> (kept: [TranscriptSegment], removed: Int) {
+        let kept = segments.filter { !isEcho($0, among: segments) }
+        return (kept, segments.count - kept.count)
     }
 
     private static func words(in text: String) -> Set<String> {
         let parts = text.lowercased().split { !$0.isLetter && !$0.isNumber }
         return Set(parts.map(String.init))
     }
+}
+
+/// A bulk change to a transcript, kept so it can be undone.
+struct TranscriptEdit {
+    let meetingID: UUID
+    let before: TranscriptFile
+    /// What changed, in plain words, such as "Removed 12 lines."
+    let message: String
 }

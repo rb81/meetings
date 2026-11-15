@@ -55,7 +55,18 @@ final class AppStore {
     private(set) var liveFile = TranscriptFile()
     private(set) var isTranscribingLive = false
     private(set) var isFinalizing = false
+    /// What the app is doing to each meeting after recording, in plain words. Changes often, so only small views
+    /// should read it. Use `isBusy` to know whether anything is running.
     private(set) var processing: [UUID: String] = [:]
+    /// How far along the current step is, from 0 to 1, when that's known.
+    private(set) var processingProgress: [UUID: Double] = [:]
+    /// Meetings with work running on them. Changes only when work starts or ends, so the transcript doesn't redraw
+    /// on every progress tick.
+    private(set) var busyMeetings: Set<UUID> = []
+    /// The last bulk change to a transcript, so it can be undone.
+    private(set) var lastEdit: TranscriptEdit?
+    /// True when your microphone keeps hearing the call through the speakers during an online meeting.
+    private(set) var micBleedWarning = false
     private(set) var revision = 0
     private(set) var hasOpenRouterKey = false
     private(set) var hasCompatibleKey = false
@@ -78,6 +89,13 @@ final class AppStore {
     @ObservationIgnored private var liveVoices: [UUID: Int] = [:]
     @ObservationIgnored private var liveNumbers: [Int: String] = [:]
     @ObservationIgnored private var pauseHotKey: GlobalHotKey?
+    @ObservationIgnored private var echoMonitor: EchoMonitor?
+    /// Microphone lines left out during this recording because they were the call, and when the latest ones were said.
+    @ObservationIgnored private var liveEchoLines = 0
+    @ObservationIgnored private var recentEchoTimes: [TimeInterval] = []
+    @ObservationIgnored private var bleedWarningDismissed = false
+    @ObservationIgnored private var mutedAt: TimeInterval?
+    @ObservationIgnored private var mutedSeconds: TimeInterval = 0
     @ObservationIgnored private var isPreview = false
 
     #if DEBUG
@@ -94,6 +112,7 @@ final class AppStore {
         reload()
         meetings.forEach { anchorBookmarks($0.id) }
         applyRetention()
+        CacheJanitor.sweepInBackground()
         models.configure(dataFolder: settings.dataFolder)
 
         notifications.onJoin = { [weak self] request in
@@ -135,6 +154,10 @@ final class AppStore {
 
     func meeting(id: UUID) -> Meeting? {
         meetings.first { $0.id == id }
+    }
+
+    func isBusy(_ id: UUID) -> Bool {
+        busyMeetings.contains(id)
     }
 
     func hasAudio(_ meeting: Meeting) -> Bool {
@@ -303,8 +326,16 @@ final class AppStore {
         pinnedSegments = []
         liveVoices = [:]
         liveNumbers = [:]
+        liveEchoLines = 0
+        recentEchoTimes = []
+        bleedWarningDismissed = false
+        micBleedWarning = false
+        mutedAt = nil
+        mutedSeconds = 0
 
         let clock = recorder.clock
+        let monitor = inPerson ? nil : EchoMonitor()
+        echoMonitor = monitor
         let recordingStats = RecordingStats()
         stats = recordingStats
 
@@ -337,6 +368,7 @@ final class AppStore {
         let meter = levels
         let onAudio: AudioHandler = { track, samples in
             meter.update(track, samples: samples)
+            monitor?.feed(track, samples: samples, endTime: clock.elapsed())
             if let live {
                 live.feed(track, samples: samples)
             } else {
@@ -365,6 +397,7 @@ final class AppStore {
             await speakerTracker?.finish()
             transcriber = nil
             speakerTracker = nil
+            echoMonitor = nil
             stats = nil
             isTranscribingLive = false
             liveSpeakersActive = false
@@ -378,6 +411,10 @@ final class AppStore {
         guard let id = activeMeetingID, !isFinalizing else { return }
         isFinalizing = true
 
+        if let mutedAt {
+            mutedSeconds += max(0, recorder.elapsed() - mutedAt)
+            self.mutedAt = nil
+        }
         await recorder.stop()
         await transcriber?.finish()
         await speakerTracker?.finish()
@@ -385,10 +422,13 @@ final class AppStore {
 
         let voices = Set(liveVoices.values).count
         let liveActivity = speakerTracker?.activity() ?? SpeakerActivity()
+        let echoCancellation = recorder.echoCancellation
         transcriber = nil
         speakerTracker = nil
+        echoMonitor = nil
         isTranscribingLive = false
         liveSpeakersActive = false
+        micBleedWarning = false
 
         update(id) { $0.endedAt = .now }
         activeMeetingID = nil
@@ -397,10 +437,15 @@ final class AppStore {
 
         if let meeting = meeting(id: id) {
             let inPerson = meeting.inPerson == true
-            if let snapshot = stats?.snapshot(
+            if var snapshot = stats?.snapshot(
                 inPerson: inPerson,
                 speakerEngine: inPerson ? (voices > 0 ? "Live (Nemotron 3), \(voices) voice\(voices == 1 ? "" : "s") heard" : "Live model not used") : "After the meeting"
             ) {
+                if !inPerson {
+                    snapshot.echoCancellation = echoCancellation
+                    snapshot.echoLinesRemoved = liveEchoLines
+                    snapshot.mutedSeconds = mutedSeconds
+                }
                 MeetingStore.saveDiagnostics(snapshot, for: meeting, in: settings.dataFolder)
             }
             stats = nil
@@ -425,14 +470,48 @@ final class AppStore {
         if recorder.isPaused { resumeRecording() } else { pauseRecording() }
     }
 
+    // MARK: Mute
+
+    /// Whether your microphone can be muted: only in online meetings, where the call is recorded separately.
+    var canMuteMic: Bool {
+        activeMeetingID != nil && activeMeeting?.inPerson != true && !isFinalizing
+    }
+
+    /// Mutes or unmutes your microphone. The call keeps recording. Handy when you're only listening, with the
+    /// sound coming out of your speakers, so the microphone doesn't pick the call up again as you.
+    func toggleMute() {
+        guard canMuteMic else { return }
+        let muting = !recorder.isMicMuted
+        recorder.setMicMuted(muting)
+
+        let now = recorder.elapsed()
+        if muting {
+            mutedAt = now
+            micBleedWarning = false
+        } else if let mutedAt {
+            mutedSeconds += max(0, now - mutedAt)
+            self.mutedAt = nil
+        }
+        // Finishes the sentence in progress, so nothing said before muting is held back.
+        transcriber?.padSilence()
+    }
+
+    /// Hides the speaker bleed warning for the rest of this meeting.
+    func dismissBleedWarning() {
+        bleedWarningDismissed = true
+        micBleedWarning = false
+    }
+
     // MARK: Live lines
 
     private func add(_ incoming: TranscriptSegment, to meeting: Meeting, in dataFolder: URL) {
-        if incoming.track == .mic, liveFile.segments.contains(where: { EchoFilter.isEcho(incoming, of: $0) }) {
-            return
-        }
-        if incoming.track == .system {
-            liveFile.segments.removeAll { EchoFilter.isEcho($0, of: incoming) }
+        let online = meeting.inPerson != true
+        if online, incoming.track == .mic {
+            let soundsLikeCall = echoMonitor?.isEcho(start: incoming.start, end: incoming.end) == true
+            if soundsLikeCall || EchoFilter.isEcho(incoming, among: liveFile.segments) {
+                noteEcho(lines: 1, at: incoming.end)
+                return
+            }
         }
 
         if meeting.inPerson == true, incoming.track == .mic, let tracker = speakerTracker {
@@ -443,8 +522,30 @@ final class AppStore {
         }
         liveFile.segments.append(incoming)
         liveFile.segments.sort { $0.start < $1.start }
+        // The call's text can arrive after your microphone's. Recheck recent microphone lines against it.
+        if online, incoming.track == .system {
+            let segments = liveFile.segments
+            let echoes = Set(segments.filter { segment in
+                segment.track == .mic && !pinnedSegments.contains(segment.id)
+                    && segment.end >= incoming.start - 5 && EchoFilter.isEcho(segment, among: segments)
+            }.map(\.id))
+            if !echoes.isEmpty {
+                liveFile.segments.removeAll { echoes.contains($0.id) }
+                noteEcho(lines: echoes.count, at: incoming.end)
+            }
+        }
         numberLiveSpeakers()
         try? MeetingStore.saveTranscript(liveFile, for: meeting, in: dataFolder)
+    }
+
+    /// Counts microphone lines left out as the call, and warns when it keeps happening while you're not muted.
+    private func noteEcho(lines: Int, at time: TimeInterval) {
+        liveEchoLines += lines
+        recentEchoTimes.append(contentsOf: Array(repeating: time, count: lines))
+        recentEchoTimes.removeAll { $0 < time - 120 }
+        if !bleedWarningDismissed, !recorder.isMicMuted, recentEchoTimes.count >= 3 {
+            micBleedWarning = true
+        }
     }
 
     /// The speaker model keeps revising its view of the last few seconds. This applies those revisions
@@ -577,17 +678,66 @@ final class AppStore {
     // MARK: Speaker edits
 
     /// Edits a transcript wherever it lives: in memory while the meeting is recording, on disk afterwards.
-    private func mutateTranscript(_ meeting: Meeting, _ change: (inout TranscriptFile) -> Void) {
+    /// With an `undo` message, the change can be taken back with `undoLastEdit`.
+    private func mutateTranscript(_ meeting: Meeting, undo: String? = nil, _ change: (inout TranscriptFile) -> Void) {
         if meeting.id == activeMeetingID {
+            if let undo { lastEdit = TranscriptEdit(meetingID: meeting.id, before: liveFile, message: undo) }
             change(&liveFile)
             try? MeetingStore.saveTranscript(liveFile, for: meeting, in: settings.dataFolder)
         } else {
             var file = MeetingStore.loadTranscript(meeting, in: settings.dataFolder)
+            if let undo { lastEdit = TranscriptEdit(meetingID: meeting.id, before: file, message: undo) }
             change(&file)
             try? MeetingStore.saveTranscript(file, for: meeting, in: settings.dataFolder)
             writeMarkdown(for: meeting)
         }
         bump()
+    }
+
+    /// Puts the transcript back as it was before the last bulk change.
+    func undoLastEdit() {
+        guard let edit = lastEdit, let meeting = meeting(id: edit.meetingID), !isBusy(edit.meetingID) else { return }
+        lastEdit = nil
+        let restored = edit.before
+        if meeting.id == activeMeetingID {
+            // Lines heard since the change are kept.
+            let known = Set(restored.segments.map(\.id))
+            let latest = restored.segments.map(\.start).max() ?? 0
+            let newer = liveFile.segments.filter { !known.contains($0.id) && $0.start > latest }
+            mutateTranscript(meeting) { file in
+                file = restored
+                file.segments += newer
+            }
+        } else {
+            mutateTranscript(meeting) { $0 = restored }
+        }
+        pinnedSegments.formUnion(restored.segments.filter { $0.pinned == true }.map(\.id))
+    }
+
+    func dismissLastEdit() {
+        lastEdit = nil
+    }
+
+    /// Takes lines out of the transcript. Flags on them move to the nearest remaining line.
+    func removeSegments(_ meeting: Meeting, ids segmentIDs: Set<UUID>) {
+        guard !segmentIDs.isEmpty else { return }
+        let count = segmentIDs.count
+        mutateTranscript(meeting, undo: "Removed \(count) line\(count == 1 ? "" : "s").") { file in
+            file.segments.removeAll { segmentIDs.contains($0.id) }
+        }
+        pinnedSegments.subtract(segmentIDs)
+        detachBookmarks(meeting.id, from: segmentIDs)
+    }
+
+    private func detachBookmarks(_ id: UUID, from segmentIDs: Set<UUID>) {
+        func attached(_ bookmark: Bookmark) -> Bool { bookmark.segmentID.map(segmentIDs.contains) == true }
+        guard meeting(id: id)?.bookmarks.contains(where: attached) == true else { return }
+        update(id) { value in
+            for index in value.bookmarks.indices where attached(value.bookmarks[index]) {
+                value.bookmarks[index].segmentID = nil
+            }
+        }
+        anchorBookmarks(id)
     }
 
     func renameSpeaker(_ meeting: Meeting, speakerID: String, to name: String) {
@@ -606,7 +756,7 @@ final class AppStore {
     func mergeSpeaker(_ meeting: Meeting, _ source: String, into target: String) {
         guard source != target else { return }
 
-        mutateTranscript(meeting) { file in
+        mutateTranscript(meeting, undo: "Merged two speakers.") { file in
             for index in file.segments.indices where file.segments[index].speakerID == source {
                 file.segments[index].speakerID = target
                 file.segments[index].pinned = true
@@ -620,10 +770,11 @@ final class AppStore {
         }
     }
 
-    /// Moves lines to another speaker. Pass `nil` to start a new speaker.
+    /// Moves lines to another speaker. Pass `nil` to start a new speaker. Moves of several lines can be undone.
     func assign(_ meeting: Meeting, segmentIDs: [UUID], to speakerID: String?) {
         let ids = Set(segmentIDs)
-        mutateTranscript(meeting) { file in
+        let undo = ids.count > 1 ? "Moved \(ids.count) lines." : nil
+        mutateTranscript(meeting, undo: undo) { file in
             let target = speakerID ?? file.nextSpeakerID
             for index in file.segments.indices where ids.contains(file.segments[index].id) {
                 file.segments[index].speakerID = target
@@ -797,8 +948,25 @@ final class AppStore {
         await runAI(meeting, notes: false, clean: true)
     }
 
+    /// Shows what's happening to a meeting. A trailing percentage, as in "Transcribing… 40%", becomes a progress bar.
     private func setStatus(_ id: UUID, _ text: String?) {
-        processing[id] = text
+        guard let text else {
+            processing[id] = nil
+            processingProgress[id] = nil
+            if busyMeetings.contains(id) { busyMeetings.remove(id) }
+            return
+        }
+        let parsed = StatusText.parse(text)
+        if processing[id] != parsed.text { processing[id] = parsed.text }
+        if processingProgress[id] != parsed.progress { processingProgress[id] = parsed.progress }
+        if !busyMeetings.contains(id) { busyMeetings.insert(id) }
+    }
+
+    /// For progress reported from other threads: ignored once the work has finished, so a late report can't
+    /// leave a stale status behind.
+    private func reportProgress(_ id: UUID, _ text: String) {
+        guard processing[id] != nil else { return }
+        setStatus(id, text)
     }
 
     private func postProcess(
@@ -814,6 +982,7 @@ final class AppStore {
         let id = meeting.id
 
         setStatus(id, "Finishing up…")
+        if lastEdit?.meetingID == id { lastEdit = nil }
         defer {
             setStatus(id, nil)
             bump()
@@ -836,9 +1005,10 @@ final class AppStore {
                 inPerson: inPerson,
                 stats: offlineStats
             ) { fraction in
-                Task { @MainActor in self.setStatus(id, "Transcribing the recording… \(Int(fraction * 100))%") }
+                Task { @MainActor in self.reportProgress(id, "Transcribing the recording… \(Int(fraction * 100))%") }
             }
-            file.segments = Self.removingEchoes(from: segments)
+            let filtered = inPerson ? (kept: segments, removed: 0) : EchoFilter.removingEchoes(from: segments)
+            file.segments = filtered.kept
             file.speakerNames = [:]
             file.mixedMic = inPerson
             try? MeetingStore.saveTranscript(file, for: meeting, in: folder)
@@ -848,12 +1018,43 @@ final class AppStore {
                     for index in value.bookmarks.indices { value.bookmarks[index].segmentID = nil }
                 }
             }
+            let previous = diagnostics
             diagnostics = offlineStats.snapshot(
                 inPerson: inPerson,
                 speakerEngine: "",
                 notes: ["Transcribed from the saved audio."]
             )
+            diagnostics.echoCancellation = previous.echoCancellation
+            diagnostics.mutedSeconds = previous.mutedSeconds
+            diagnostics.echoLinesRemoved = inPerson ? nil : filtered.removed
             bump()
+        }
+
+        // Without headphones the microphone hears the call through the speakers. Compare the two recordings and
+        // take out microphone lines that were really the call.
+        if !inPerson, !speakersOnly,
+           let micFile = existingAudio(.mic, for: meeting, in: folder),
+           let systemFile = existingAudio(.system, for: meeting, in: folder) {
+            let pinned = pinnedSegments
+            let candidates = file.segments.filter { $0.track == .mic && $0.pinned != true && !pinned.contains($0.id) }
+            if !candidates.isEmpty {
+                let label = "Checking your microphone for the call…"
+                setStatus(id, "\(label) 0%")
+                do {
+                    let echoes = try await EchoDetector.echoes(in: candidates, micAudio: micFile, systemAudio: systemFile) { fraction in
+                        Task { @MainActor in self.reportProgress(id, "\(label) \(Int(fraction * 100))%") }
+                    }
+                    if !echoes.isEmpty {
+                        file.segments.removeAll { echoes.contains($0.id) }
+                        try? MeetingStore.saveTranscript(file, for: meeting, in: folder)
+                        detachBookmarks(id, from: echoes)
+                        diagnostics.echoLinesRemoved = (diagnostics.echoLinesRemoved ?? 0) + echoes.count
+                        bump()
+                    }
+                } catch {
+                    log.error("Couldn't compare the recordings for echo: \(error.localizedDescription)")
+                }
+            }
         }
 
         let systemURL = existingAudio(.system, for: meeting, in: folder)
@@ -876,7 +1077,7 @@ final class AppStore {
                 speakerNames: file.speakerNames,
                 systemAudio: systemURL,
                 micAudio: micURL,
-                systemManager: systemURL == nil ? nil : models.makeDiarizer(maxSpeakers: nil),
+                systemManager: systemURL == nil ? nil : models.makeDiarizer(maxSpeakers: nil, exactly: inPerson ? nil : expected),
                 room: room,
                 micManager: diarizeMic && room == nil ? models.makeDiarizer(maxSpeakers: 4, exactly: expected) : nil,
                 diarizeMic: diarizeMic,
@@ -885,7 +1086,7 @@ final class AppStore {
                 pinned: pinnedSegments.union(file.segments.filter { $0.pinned == true }.map(\.id)),
                 inPerson: inPerson,
                 onProgress: { [weak self] text in
-                    Task { @MainActor in self?.setStatus(id, text) }
+                    Task { @MainActor in self?.reportProgress(id, text) }
                 }
             )
             file.segments = outcome.segments
@@ -907,6 +1108,15 @@ final class AppStore {
                     }
                 } else if useLive {
                     pass = "live voices, cut where the speaker changed"
+                }
+            } else {
+                if let expected {
+                    pass += outcome.systemVoices < expected
+                        ? ", heard \(outcome.systemVoices) of the \(expected) people you said were on the call"
+                        : " for \(expected) people on the call"
+                }
+                if outcome.systemMerged > 0 {
+                    pass += "; joined \(outcome.systemMerged) voice\(outcome.systemMerged == 1 ? "" : "s") that sounded like someone else"
                 }
             }
             // Straight after a meeting the live engine's line is kept and extended. A later redo replaces it.
@@ -970,13 +1180,6 @@ final class AppStore {
     private func existingAudio(_ track: AudioTrack, for meeting: Meeting, in folder: URL) -> URL? {
         let url = MeetingStore.audioURL(track, for: meeting, in: folder)
         return FileManager.default.fileExists(atPath: url.path) ? url : nil
-    }
-
-    private static func removingEchoes(from segments: [TranscriptSegment]) -> [TranscriptSegment] {
-        let system = segments.filter { $0.track == .system }
-        return segments.filter { segment in
-            segment.track != .mic || !system.contains { EchoFilter.isEcho(segment, of: $0) }
-        }
     }
 
     private func runAI(_ meeting: Meeting, notes: Bool, clean: Bool, alreadyProcessing: Bool = false) async {

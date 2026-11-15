@@ -38,16 +38,19 @@ struct MeetingDetailView: View {
     @State private var notes: MeetingNotes?
     @State private var confirmDelete = false
     @State private var showDiagnostics = false
+    @State private var diagnostics: MeetingDiagnostics?
+    @State private var selection: Set<UUID> = []
+    @State private var confirmRemoveSelection = false
 
     private var diagnosticsText: String {
-        store.diagnostics(for: meeting)?.text
+        diagnostics?.text
             ?? "No diagnostics were saved for this meeting. They're recorded for meetings made with this version of the app."
     }
 
     private var isActive: Bool { meeting.id == store.activeMeetingID }
     private var file: TranscriptFile { isActive ? store.liveFile : saved }
     private var audioSaved: Bool { store.hasAudio(meeting) }
-    private var status: String? { store.processing[meeting.id] }
+    private var isBusy: Bool { store.isBusy(meeting.id) }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -71,20 +74,33 @@ struct MeetingDetailView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 20) {
                         content
-                        Color.clear.frame(height: 1).id("bottom")
+                        Color.clear.frame(height: tab == .transcript ? 48 : 1).id("bottom")
                     }
                     .padding(Theme.pad)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .scrollIndicators(.never)
+                .scrollIndicators(.visible)
                 .onChange(of: store.liveFile.segments.count) {
-                    guard isActive, tab == .transcript else { return }
+                    // Only follow new lines when nothing is selected, so the view doesn't jump while you edit.
+                    guard isActive, tab == .transcript, selection.isEmpty else { return }
                     withAnimation { proxy.scrollTo("bottom", anchor: .bottom) }
+                }
+            }
+            .overlay(alignment: .bottom) {
+                if tab == .transcript {
+                    TranscriptActionBar(
+                        meeting: meeting,
+                        file: file,
+                        selection: $selection,
+                        confirmRemove: $confirmRemoveSelection
+                    )
+                    .padding(.bottom, 16)
                 }
             }
         }
         .task(id: meeting.id) {
             title = meeting.title
+            selection = []
             tab = isActive ? .transcript : (store.notes(for: meeting) != nil ? .summary : .transcript)
         }
         .task(id: "\(meeting.id)|\(store.revision)|\(isActive)") {
@@ -92,6 +108,25 @@ struct MeetingDetailView: View {
                 saved = store.transcript(for: meeting)
             }
             notes = store.notes(for: meeting)
+            diagnostics = isActive ? nil : store.diagnostics(for: meeting)
+            // Lines removed elsewhere can't stay selected.
+            let present = Set(file.segments.map(\.id))
+            if !selection.isSubset(of: present) { selection.formIntersection(present) }
+        }
+        .onExitCommand {
+            if !selection.isEmpty { selection = [] }
+        }
+        .confirmationDialog(
+            "Remove \(selection.count) selected line\(selection.count == 1 ? "" : "s")?",
+            isPresented: $confirmRemoveSelection,
+            titleVisibility: .visible
+        ) {
+            Button("Remove", role: .destructive) {
+                store.removeSegments(meeting, ids: selection)
+                selection = []
+            }
+        } message: {
+            Text("You can undo this from the bar at the bottom of the window.")
         }
         .confirmationDialog("Delete this meeting?", isPresented: $confirmDelete, titleVisibility: .visible) {
             Button("Delete", role: .destructive) {
@@ -144,16 +179,8 @@ struct MeetingDetailView: View {
             if isActive {
                 let paused = store.recorder.isPaused
                 Chip(text: paused ? "Paused" : "Recording", symbol: "circle.fill", tint: paused ? Theme.amber : Theme.red)
-            } else if let status {
-                HStack(spacing: 6) {
-                    ProgressView().controlSize(.mini)
-                    Text(status)
-                        .font(.system(size: 11, weight: .semibold))
-                }
-                .foregroundStyle(Theme.blue)
-                .padding(.horizontal, 9)
-                .frame(height: 22)
-                .background(Theme.blue.opacity(0.14), in: Capsule())
+            } else if isBusy {
+                ProcessingStatusChip(meetingID: meeting.id)
             }
         }
     }
@@ -190,7 +217,7 @@ struct MeetingDetailView: View {
                     Button(file.segments.isEmpty ? "Transcribe Recording" : "Transcribe Again") {
                         Task { await store.transcribeSavedAudio(meeting) }
                     }
-                    .disabled(!store.models.isReady || status != nil)
+                    .disabled(!store.models.isReady || isBusy)
                     Toggle("In-person meeting", isOn: Binding(
                         get: { meeting.inPerson == true },
                         set: { store.setInPerson(meeting, $0) }
@@ -199,7 +226,7 @@ struct MeetingDetailView: View {
                         Task { await store.identifySpeakers(meeting) }
                     }
                     .disabled((meeting.inPerson == true ? !store.models.hasRoomModels && store.models.diarizer == nil : store.models.diarizer == nil)
-                              || file.segments.isEmpty || status != nil)
+                              || file.segments.isEmpty || isBusy)
                     Button("Delete Audio", role: .destructive) {
                         store.deleteAudio(meeting)
                     }
@@ -212,7 +239,7 @@ struct MeetingDetailView: View {
                 Button("Delete Meeting…", role: .destructive) {
                     confirmDelete = true
                 }
-                .disabled(isActive || status != nil)
+                .disabled(isActive || isBusy)
             } label: {
                 Image(systemName: "ellipsis")
                     .frame(width: 32, height: 32)
@@ -237,12 +264,120 @@ struct MeetingDetailView: View {
                 file: file,
                 isLive: isActive && store.isTranscribingLive,
                 isActive: isActive,
-                audioSaved: audioSaved
+                audioSaved: audioSaved,
+                diagnostics: diagnostics,
+                selection: $selection
             )
         case .notes:
             NotesTab(meeting: meeting, file: file, isActive: isActive, audioSaved: audioSaved)
         case .ask:
             AskTab(meeting: meeting, file: file)
         }
+    }
+}
+
+/// What's happening to a meeting after recording, with a bar when the step's progress is known.
+/// Kept separate so progress ticks only redraw this chip, not the transcript.
+private struct ProcessingStatusChip: View {
+    @Environment(AppStore.self) private var store
+    let meetingID: UUID
+
+    var body: some View {
+        let status = store.processing[meetingID] ?? "Working…"
+        let progress = store.processingProgress[meetingID]
+
+        HStack(spacing: 8) {
+            if progress == nil {
+                ProgressView().controlSize(.mini)
+            }
+            Text(status)
+                .font(.system(size: 11, weight: .semibold))
+                .lineLimit(1)
+            if let progress {
+                ProgressView(value: progress)
+                    .progressViewStyle(.linear)
+                    .tint(Theme.blue)
+                    .frame(width: 80)
+                Text(progress, format: .percent.precision(.fractionLength(0)))
+                    .font(.system(size: 11, weight: .semibold).monospacedDigit())
+                    .frame(minWidth: 30, alignment: .trailing)
+            }
+        }
+        .foregroundStyle(Theme.blue)
+        .padding(.horizontal, 9)
+        .frame(height: 22)
+        .background(Theme.blue.opacity(0.14), in: Capsule())
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// Floats over the transcript: actions for the selected lines, or a way to undo the last bulk change.
+private struct TranscriptActionBar: View {
+    @Environment(AppStore.self) private var store
+    let meeting: Meeting
+    let file: TranscriptFile
+    @Binding var selection: Set<UUID>
+    @Binding var confirmRemove: Bool
+
+    var body: some View {
+        if !selection.isEmpty {
+            bar {
+                Text("\(selection.count) line\(selection.count == 1 ? "" : "s") selected")
+                    .font(.system(size: 12, weight: .semibold))
+                Menu("Move To…") {
+                    ForEach(file.speakerIDs, id: \.self) { target in
+                        Button(file.name(for: target)) { move(to: target) }
+                    }
+                    Button("New Speaker") { move(to: nil) }
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                Button("Remove…") { confirmRemove = true }
+                    .buttonStyle(SecondaryButtonStyle(height: 26))
+                Button {
+                    selection = []
+                } label: {
+                    Image(systemName: "xmark")
+                }
+                .buttonStyle(IconButtonStyle(size: 26))
+                .help("Clear the selection (Esc)")
+                .accessibilityLabel("Clear selection")
+            }
+        } else if let edit = store.lastEdit, edit.meetingID == meeting.id {
+            bar {
+                Text(edit.message)
+                    .font(.system(size: 12, weight: .semibold))
+                Button("Undo") { store.undoLastEdit() }
+                    .buttonStyle(SecondaryButtonStyle(height: 26))
+                    .disabled(store.isBusy(meeting.id))
+                Button {
+                    store.dismissLastEdit()
+                } label: {
+                    Image(systemName: "xmark")
+                }
+                .buttonStyle(IconButtonStyle(size: 26))
+                .help("Dismiss")
+                .accessibilityLabel("Dismiss")
+            }
+        }
+    }
+
+    private func move(to target: String?) {
+        let ordered = file.segments.map(\.id).filter(selection.contains)
+        store.assign(meeting, segmentIDs: ordered, to: target)
+        selection = []
+    }
+
+    private func bar(@ViewBuilder _ content: () -> some View) -> some View {
+        HStack(spacing: 12) {
+            content()
+        }
+        .padding(.leading, 16)
+        .padding(.trailing, 8)
+        .frame(height: 40)
+        .background(Theme.raised, in: Capsule())
+        .overlay(Capsule().strokeBorder(Theme.stroke))
+        .shadow(color: .black.opacity(0.18), radius: 12, y: 4)
+        .transition(.move(edge: .bottom).combined(with: .opacity))
     }
 }

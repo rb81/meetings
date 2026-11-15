@@ -216,6 +216,8 @@ struct LevelBar: View {
     let meter: LevelMeter
     let track: AudioTrack
     var width: CGFloat = 64
+    /// Shows that this input is muted, instead of its level.
+    var muted = false
 
     var body: some View {
         HStack(spacing: 8) {
@@ -223,16 +225,27 @@ struct LevelBar: View {
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.secondary)
                 .frame(width: 38, alignment: .leading)
-            TimelineView(.animation(minimumInterval: 1.0 / 15)) { _ in
-                let level = CGFloat(meter.read(track))
-                ZStack(alignment: .leading) {
-                    Capsule().fill(Color.primary.opacity(0.10))
-                    Capsule()
-                        .fill(level > 0.9 ? Theme.amber : Theme.green)
-                        .frame(width: max(4, width * level))
-                }
-                .frame(width: width, height: 5)
+            if muted {
+                Label("Muted", systemImage: "mic.slash.fill")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(Theme.amber)
+                    .frame(width: width, height: 5, alignment: .leading)
+            } else {
+                meterBar
             }
+        }
+    }
+
+    private var meterBar: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 15)) { _ in
+            let level = CGFloat(meter.read(track))
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.primary.opacity(0.10))
+                Capsule()
+                    .fill(level > 0.9 ? Theme.amber : Theme.green)
+                    .frame(width: max(4, width * level))
+            }
+            .frame(width: width, height: 5)
         }
     }
 }

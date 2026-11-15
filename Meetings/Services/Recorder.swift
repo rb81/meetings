@@ -70,10 +70,18 @@ final class RecordingClock: @unchecked Sendable {
 /// Tells the audio threads to drop audio while a meeting is paused.
 final class CaptureGate: @unchecked Sendable {
     private let paused = OSAllocatedUnfairLock(initialState: false)
+    private let muted = OSAllocatedUnfairLock(initialState: false)
 
     var isPaused: Bool {
         get { paused.withLock { $0 } }
         set { paused.withLock { $0 = newValue } }
+    }
+
+    /// While true the microphone records silence instead of sound, so the recording keeps its length and stays in step
+    /// with the call audio.
+    var isMicMuted: Bool {
+        get { muted.withLock { $0 } }
+        set { muted.withLock { $0 = newValue } }
     }
 }
 
@@ -82,8 +90,12 @@ final class CaptureGate: @unchecked Sendable {
 final class Recorder {
     private(set) var isRecording = false
     private(set) var isPaused = false
+    /// True while your microphone is muted. The call is still recorded.
+    private(set) var isMicMuted = false
     private(set) var startedAt: Date?
     private(set) var warning: String?
+    /// How echo cancellation was set up for this recording, in plain words, for the diagnostics.
+    private(set) var echoCancellation: String?
 
     let clock = RecordingClock()
     private let session = CaptureSession()
@@ -110,13 +122,22 @@ final class Recorder {
                 captureSystemAudio: captureSystemAudio,
                 onAudio: onAudio
             )
+            self.echoCancellation = session.echoCancellation
         } catch {
             clock.reset()
             throw error
         }
         startedAt = .now
         isPaused = false
+        isMicMuted = false
         isRecording = true
+    }
+
+    /// Mutes or unmutes your microphone without stopping the recording.
+    func setMicMuted(_ muted: Bool) {
+        guard isRecording else { return }
+        session.setMicMuted(muted)
+        isMicMuted = muted
     }
 
     func pause() {
@@ -138,6 +159,7 @@ final class Recorder {
         clock.reset()
         isRecording = false
         isPaused = false
+        isMicMuted = false
         startedAt = nil
         warning = nil
     }
@@ -159,9 +181,15 @@ final class CaptureSession: @unchecked Sendable {
     private var systemWriter: SystemAudioWriter?
     private let gate = CaptureGate()
     private let log = Logger(subsystem: "com.rakan.Meetings", category: "recording")
+    /// How echo cancellation was set up by the last `start`, in plain words.
+    private(set) var echoCancellation = "Off"
 
     func setPaused(_ paused: Bool) {
         gate.isPaused = paused
+    }
+
+    func setMicMuted(_ muted: Bool) {
+        gate.isMicMuted = muted
     }
 
     /// Returns a warning when something couldn't be set up but recording can continue.
@@ -180,6 +208,7 @@ final class CaptureSession: @unchecked Sendable {
         // A fresh engine each time, so a microphone or echo-cancellation choice never carries over to the next meeting.
         engine = AVAudioEngine()
         gate.isPaused = false
+        gate.isMicMuted = false
 
         var warnings: [String] = []
         if let note = microphone.note { warnings.append(note) }
@@ -189,6 +218,7 @@ final class CaptureSession: @unchecked Sendable {
         if echoCancellation, !useEchoCancellation {
             log.info("Headphones detected, skipping echo cancellation")
         }
+        self.echoCancellation = useEchoCancellation ? "On" : (echoCancellation ? "Off, headphones in use" : "Off")
 
         if useEchoCancellation {
             do {
@@ -199,6 +229,7 @@ final class CaptureSession: @unchecked Sendable {
                 engine = AVAudioEngine()
                 try startMic(into: micURL, voiceProcessing: false, deviceUID: nil, onAudio: onAudio)
                 warnings.append("Echo cancellation couldn't start, so headphones work best.")
+                self.echoCancellation = "Couldn't start: \(error.localizedDescription)"
             }
         } else {
             do {
@@ -236,6 +267,7 @@ final class CaptureSession: @unchecked Sendable {
         micWriter = nil
         systemWriter = nil
         gate.isPaused = false
+        gate.isMicMuted = false
     }
 
     private func startMic(into url: URL, voiceProcessing: Bool, deviceUID: String?, onAudio: AudioHandler?) throws {
@@ -263,7 +295,11 @@ final class CaptureSession: @unchecked Sendable {
 
         input.installTap(onBus: 0, bufferSize: 4096, format: format) { buffer, _ in
             if gate.isPaused { return }
-            guard let source = voiceProcessing ? buffer.firstChannelCopy() : buffer.stereoCopy() else { return }
+            guard var source = voiceProcessing ? buffer.firstChannelCopy() : buffer.stereoCopy() else { return }
+            if gate.isMicMuted {
+                guard let silence = source.silentCopy() else { return }
+                source = silence
+            }
             mic.write(source)
             if let onAudio {
                 onAudio(.mic, resampler.convert(source))
@@ -480,6 +516,16 @@ private extension AVAudioPCMBuffer {
             }
             destination[0][frame] = left / leftCount
             destination[1][frame] = right / rightCount
+        }
+        return copy
+    }
+
+    /// A buffer of the same format and length holding only silence.
+    func silentCopy() -> AVAudioPCMBuffer? {
+        guard let copy = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameLength) else { return nil }
+        copy.frameLength = frameLength
+        for buffer in UnsafeMutableAudioBufferListPointer(copy.mutableAudioBufferList) {
+            if let data = buffer.mData { memset(data, 0, Int(buffer.mDataByteSize)) }
         }
         return copy
     }

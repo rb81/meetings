@@ -76,6 +76,8 @@ struct MenuBarView: View {
                         .lineLimit(1)
                     if store.recorder.isPaused {
                         Chip(text: "Paused", tint: Theme.amber)
+                    } else if store.recorder.isMicMuted {
+                        Chip(text: "Muted", symbol: "mic.slash.fill", tint: Theme.amber)
                     }
                 }
                 HStack {
@@ -84,6 +86,9 @@ struct MenuBarView: View {
                             .font(.system(size: 32, weight: .semibold, design: .rounded).monospacedDigit())
                     }
                     Spacer()
+                    if store.activeMeeting?.inPerson != true {
+                        MuteButton(size: 36)
+                    }
                     Button {
                         store.addBookmark()
                     } label: {
@@ -100,7 +105,7 @@ struct MenuBarView: View {
                 if store.activeMeeting?.inPerson == true {
                     LevelBar(label: "Room", meter: store.levels, track: .mic, width: 56)
                 } else {
-                    LevelBar(label: "You", meter: store.levels, track: .mic, width: 56)
+                    LevelBar(label: "You", meter: store.levels, track: .mic, width: 56, muted: store.recorder.isMicMuted)
                     LevelBar(label: "Others", meter: store.levels, track: .system, width: 56)
                 }
             }

@@ -429,7 +429,7 @@ struct MeetingRow: View {
                 Spacer(minLength: 0)
                 if meeting.id == store.activeMeetingID {
                     Circle().fill(Theme.red).frame(width: 8, height: 8)
-                } else if store.processing[meeting.id] != nil {
+                } else if store.isBusy(meeting.id) {
                     ProgressView().controlSize(.mini)
                 }
             }

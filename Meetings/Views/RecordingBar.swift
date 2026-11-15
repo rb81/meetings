@@ -38,6 +38,30 @@ private struct PulsingDot: View {
     }
 }
 
+/// Mutes your microphone in an online meeting while the call keeps recording.
+struct MuteButton: View {
+    @Environment(AppStore.self) private var store
+    var size: CGFloat = 32
+
+    var body: some View {
+        let muted = store.recorder.isMicMuted
+
+        Button {
+            store.toggleMute()
+        } label: {
+            Image(systemName: muted ? "mic.slash.fill" : "mic")
+                .foregroundStyle(muted ? Theme.amber : .primary)
+        }
+        .buttonStyle(IconButtonStyle(size: size))
+        .keyboardShortcut("m", modifiers: [.command, .shift])
+        .disabled(!store.canMuteMic)
+        .help(muted
+              ? "Unmute your microphone (⇧⌘M)"
+              : "Mute your microphone (⇧⌘M). The call keeps recording. Use it when you're only listening without headphones.")
+        .accessibilityLabel(muted ? "Unmute microphone" : "Mute microphone")
+    }
+}
+
 struct RecordingBar: View {
     @Environment(AppStore.self) private var store
     @State private var showingWarning = false
@@ -92,7 +116,7 @@ struct RecordingBar: View {
                 if store.activeMeeting?.inPerson == true {
                     LevelBar(label: "Room", meter: store.levels, track: .mic, width: 72)
                 } else {
-                    LevelBar(label: "You", meter: store.levels, track: .mic, width: 72)
+                    LevelBar(label: "You", meter: store.levels, track: .mic, width: 72, muted: store.recorder.isMicMuted)
                     LevelBar(label: "Others", meter: store.levels, track: .system, width: 72)
                 }
             }
@@ -107,6 +131,10 @@ struct RecordingBar: View {
                 }
 
                 flagButton
+
+                if store.activeMeeting?.inPerson != true {
+                    MuteButton(size: 32)
+                }
 
                 Button {
                     store.togglePause()
@@ -188,6 +216,7 @@ struct RecordingBar: View {
     private var statusText: String {
         if store.isFinalizing { return "Finishing transcript…" }
         if store.recorder.isPaused { return "Paused" }
+        if store.recorder.isMicMuted { return "Your microphone is muted" }
         guard store.isTranscribingLive else { return "Audio only" }
         return store.liveSpeakersActive ? "Live transcription and speakers" : "Live transcription on"
     }

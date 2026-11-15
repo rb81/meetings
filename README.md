@@ -16,6 +16,8 @@ Requires **macOS 15 or later**. Signed Mac builds will be published on the Relea
 
 - **Record online or in person.** Capture your microphone and call audio, or the voices around the table.
 - **See the conversation as it happens.** Live transcripts, speaker labels, and names you can edit.
+- **Tidy speakers quickly.** ⌘-click or ⇧-click to select many lines and move or remove them at once, move a whole speaker or everything after a point in one step, and undo any change.
+- **No headphones? No problem.** When the call leaks from your speakers into your microphone, Meetings spots it and drops the duplicated lines. Tap **Mute Me** (⇧⌘M) during a call where you're only listening.
 - **Find the important bits.** Search past meetings, flag moments, and revisit the recording alongside the transcript.
 - **Get optional AI help.** Summaries, action items, and questions about your meeting, using Apple Intelligence, Ollama, OpenRouter, or an OpenAI-compatible provider you choose.
 - **Keep your day in view.** Connect Calendar for upcoming meetings and optional reminders, or start a recording straight from the menu bar.
@@ -38,6 +40,12 @@ Cloud AI is optional. If you choose a cloud provider, the meeting text needed fo
 **Offline mode** blocks remote AI and update checks. Model downloads still work when you explicitly request them. Links you open launch in your browser.
 
 You can keep recordings or automatically delete the audio after transcription or after a set period.
+
+macOS keeps a compiled copy of the speech models in the app's cache. Meetings removes stale and half-finished copies on launch, and **Settings → Storage** shows the cache size with a button to clear it.
+
+## Building from source
+
+Open `Meetings.xcodeproj` in Xcode and run the **Meetings** scheme. Tests run with ⌘U from the same shared scheme.
 
 ## Updates
 
